@@ -6,6 +6,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
+import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1064,6 +1065,44 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       );
       expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(2);
     }),
+  );
+
+  it.effect.each([
+    ["balanced", 5],
+    ["performance", 1],
+  ] as const)(
+    "asks the host for an unchanged branch once per %s lookup interval",
+    ([profile, minutes]) =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        yield* initRepo(repoDir);
+        const remoteDir = yield* createBareRemote();
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        yield* runGit(repoDir, ["checkout", "-b", "feature/lookup-interval"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "feature/lookup-interval"]);
+        const { manager, ghCalls } = yield* makeManager({
+          ghScenario: { prListSequence: ["[]"] },
+          serverSettings: { backgroundActivity: { profile } },
+        });
+        const lookups = () => ghCalls.filter((call) => call.startsWith("pr list ")).length;
+        const ask = manager.branchPullRequest({ cwd: repoDir, branch: "feature/lookup-interval" });
+
+        yield* ask;
+        yield* TestClock.adjust(Duration.seconds(minutes * 60 - 1));
+        yield* ask;
+        expect(lookups()).toBe(1);
+
+        yield* TestClock.adjust("2 seconds");
+        yield* ask;
+        expect(lookups()).toBe(2);
+
+        // Turn ends and explicit refreshes do not wait for the interval.
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "feature/lookup-interval" },
+          { refresh: true },
+        );
+        expect(lookups()).toBe(3);
+      }),
   );
 
   it.effect("turn-end refresh preserves failed PR lookup backoff", () =>
