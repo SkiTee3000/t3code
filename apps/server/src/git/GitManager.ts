@@ -1070,8 +1070,8 @@ export const make = Effect.gen(function* () {
   // Every background reader of a branch's pull request (thread discovery,
   // settlement, status) goes through this cache, so its lifetime is the one
   // place that bounds how often the hosting CLI runs for an unchanged branch.
-  // Set by each lookup, read by `timeToLive` right after it.
-  let prLookupTtl = PR_LOOKUP_CACHE_TTL;
+  // Each entry carries the interval it was looked up under; lookups of
+  // different branches overlap, so a shared value could come from another one.
   const readPrLookupTtl = serverSettingsService.getSettings.pipe(
     Effect.map((settings) =>
       Duration.max(
@@ -1099,10 +1099,10 @@ export const make = Effect.gen(function* () {
         ...(remoteName.length > 0 ? { remoteName } : {}),
       };
       return Effect.gen(function* () {
-        prLookupTtl = yield* readPrLookupTtl;
+        const ttl = yield* readPrLookupTtl;
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
         if (!lookup) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, ttl };
         }
         // Only skip when the branch is untracked as well: anything carrying an
         // upstream keeps the old behaviour.
@@ -1111,10 +1111,10 @@ export const make = Effect.gen(function* () {
           details.upstreamRef === null &&
           (yield* isUnpublishedBranch(cwd, headContext))
         ) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, ttl };
         }
         const latest = yield* findLatestPrForHeadContext(cwd, headContext);
-        return { latest, headContext };
+        return { latest, headContext, ttl };
       });
     },
     {
@@ -1122,7 +1122,7 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit, key) => {
         if (Exit.isSuccess(exit)) {
           prLookupFailureStreakByKey.delete(key);
-          return prLookupTtl;
+          return exit.value.ttl;
         }
         return nextPrLookupFailureTtl(key);
       },
