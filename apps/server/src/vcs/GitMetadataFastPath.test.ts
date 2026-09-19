@@ -455,6 +455,92 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     ).toBeNull();
   });
 
+  it("leaves the command to git when its environment moves git or its config", async () => {
+    const home = useGlobalConfig(
+      "home-ambient",
+      '[remote "shared"]\n\turl = https://ambient.example\n',
+    );
+    const otherHome = NodePath.join(root, "home-of-the-command");
+    NodeFS.mkdirSync(otherHome, { recursive: true });
+    const args = ["config", "--get", "remote.shared.url"];
+    const cwd = repos.noRemotes!;
+    // The spawned git would read the other home's config, which has no such remote.
+    for (const key of ["HOME", "USERPROFILE", "XDG_CONFIG_HOME"]) {
+      expect(await tryAnswerGitCommand({ cwd, args, env: { [key]: otherHome } })).toBeNull();
+    }
+    expect(
+      await tryAnswerGitCommand({ cwd, args, env: { PATH: NodePath.join(root, "other-git") } }),
+    ).toBeNull();
+    // Restating the server's own value changes nothing.
+    expect(await tryAnswerGitCommand({ cwd, args, env: { HOME: home } })).toEqual({
+      exitCode: 0,
+      stdout: "https://ambient.example\n",
+      stderr: "",
+    });
+  });
+
+  it("notices a global include that appears after the config was listed", async () => {
+    const home = useGlobalConfig(
+      "home-include",
+      "[include]\n\tpath = later.inc\n\tpath = ~/tilde.inc\n",
+    );
+    const cwd = repos.noRemotes!;
+    const get = (name: string) => ["config", "--get", `remote.${name}.url`];
+    expect(await tryAnswerGitCommand({ cwd, args: get("later") })).toEqual({
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+    });
+    const answered = async (file: string, name: string) => {
+      NodeFS.writeFileSync(
+        NodePath.join(home, file),
+        `[remote "${name}"]\n\turl = https://${name}.example\n`,
+      );
+      expect(await tryAnswerGitCommand({ cwd, args: get(name) })).toEqual({
+        exitCode: 0,
+        stdout: `https://${name}.example\n`,
+        stderr: "",
+      });
+    };
+    await answered("later.inc", "later");
+    await answered("tilde.inc", "tilde");
+  });
+
+  it("stays inside the caller's time and output budget", async () => {
+    const cwd = repos.plain!;
+    expect(await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], timeoutMs: 0 })).toBeNull();
+    expect(
+      await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], timeoutMs: null }),
+    ).not.toBeNull();
+
+    const listing = git(cwd, "remote", "-v");
+    const fits = Buffer.byteLength(listing);
+    expect(
+      await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], maxOutputBytes: fits }),
+    ).toEqual({ exitCode: 0, stdout: listing, stderr: "" });
+    expect(
+      await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], maxOutputBytes: fits - 1 }),
+    ).toBeNull();
+    // stderr counts too: the missing-upstream message is longer than this cap.
+    expect(
+      await tryAnswerGitCommand({
+        cwd: repos.noRemotes!,
+        args: ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        env: { LC_ALL: "C" },
+        maxOutputBytes: 8,
+      }),
+    ).toBeNull();
+  });
+
+  it.skipIf(NodePath.sep === "\\")(
+    "does not wait on a FIFO standing where a file would be",
+    async () => {
+      const fifoRepo = makeRepo("fifo");
+      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(fifoRepo, ".git", "packed-refs")]);
+      await declines(fifoRepo, "show-ref", "--verify", "--quiet", "refs/heads/missing");
+    },
+  );
+
   it("walks past a directory with a broken HEAD, as git does", async () => {
     const outer = makeRepo("outerOfBroken", (dir) =>
       git(dir, "remote", "add", "origin", "https://example.com/outer.git"),
