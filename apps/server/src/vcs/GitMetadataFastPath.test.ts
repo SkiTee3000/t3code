@@ -1,9 +1,9 @@
-// @effect-diagnostics nodeBuiltinImport:off - the module under test is plain Node; fixtures are built with real git.
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off - the module under test is plain Node; fixtures are built with real git.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   gitAnswerMemoKey,
@@ -540,6 +540,40 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
       await declines(fifoRepo, "show-ref", "--verify", "--quiet", "refs/heads/missing");
     },
   );
+
+  it("remembers that the global config could not be used instead of asking git every time", async () => {
+    // A key without a value is legal to git; this reader leaves such a config to git.
+    const home = useGlobalConfig("home-valueless", "[core]\n\tvalueless\n");
+    const args = ["remote", "get-url", "origin"];
+    await declines(repos.plain!, ...args);
+
+    NodeFS.writeFileSync(NodePath.join(home, ".gitconfig"), "");
+    const now = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      // Still inside the retry pause: the listing is not repeated for this command.
+      await declines(repos.plain!, ...args);
+      vi.setSystemTime(now + 31_000);
+      expect(await tryAnswerGitCommand({ cwd: repos.plain!, args })).toEqual({
+        exitCode: 0,
+        stdout: "https://github.com/acme/widgets.git\n",
+        stderr: "",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves refs that belong to one worktree to git", async () => {
+    const linked = repos.linkedWorktree!;
+    git(linked, "update-ref", "refs/bisect/bad", "HEAD");
+    git(linked, "update-ref", "refs/worktree/mark", "HEAD");
+    for (const cwd of [linked, repos.plain!]) {
+      await declines(cwd, "show-ref", "--verify", "--quiet", "refs/bisect/bad");
+      await declines(cwd, "show-ref", "--verify", "--quiet", "refs/worktree/mark");
+      await declines(cwd, "show-ref", "--verify", "--quiet", "refs/rewritten/onto");
+    }
+  });
 
   it("walks past a directory with a broken HEAD, as git does", async () => {
     const outer = makeRepo("outerOfBroken", (dir) =>
