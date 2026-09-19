@@ -559,6 +559,18 @@ export const withPathDirectoryListings = <A, E, R>(effect: Effect.Effect<A, E, R
     return yield* effect.pipe(Effect.provideService(PathDirectoryListings, listings));
   });
 
+// An injected resolver may answer differently for the same search, so its
+// entries are kept apart from every other resolver's.
+let spawnResolverCacheIdCount = 0;
+const spawnResolverCacheIds = new WeakMap<SpawnExecutableResolver, number>();
+function spawnResolverCacheId(resolver: SpawnExecutableResolver): number {
+  const known = spawnResolverCacheIds.get(resolver);
+  if (known !== undefined) return known;
+  const id = spawnResolverCacheIdCount++;
+  spawnResolverCacheIds.set(resolver, id);
+  return id;
+}
+
 function cacheCommandResolution(
   cache: Map<string, CommandResolutionCacheEntry>,
   cacheKey: string,
@@ -708,6 +720,7 @@ export const resolveSpawnCommand = Effect.fnUntraced(function* (
   const cache = yield* CommandResolutionCache;
   const cacheKey = [
     "spawn",
+    String(spawnResolverCacheId(resolveExecutable)),
     platform,
     resolvePathEnvironmentVariable(env),
     resolveWindowsPathExtensions(env).join(";"),

@@ -24,6 +24,7 @@ import {
   resolveSpawnCommand,
   resolveWindowsEnvironment,
   SpawnExecutableResolution,
+  type SpawnExecutableResolver,
   WindowsShellEnvironment,
   withPathDirectoryListings,
   type WindowsShellEnvironmentReader,
@@ -585,13 +586,14 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
   it.effect("scans PATH once per command until the search environment changes", () =>
     Effect.gen(function* () {
       const scans: Array<string> = [];
-      const resolve = (command: string, path: string) =>
+      const scan: SpawnExecutableResolver = (name, _platform, env) => {
+        scans.push(`${name}@${env.PATH}`);
+        return name === "missing" ? undefined : `${env.PATH}\\${name}.exe`;
+      };
+      const resolve = (command: string, path: string, resolver = scan) =>
         resolveSpawnCommand(command, [], { env: { PATH: path, PATHEXT: ".EXE" } }).pipe(
           Effect.provideService(HostProcessPlatform, "win32"),
-          Effect.provideService(SpawnExecutableResolution, (name, _platform, env) => {
-            scans.push(`${name}@${env.PATH}`);
-            return name === "missing" ? undefined : `${env.PATH}\\${name}.exe`;
-          }),
+          Effect.provideService(SpawnExecutableResolution, resolver),
         );
 
       expect((yield* resolve("git", "C:\\one")).command).toBe("C:\\one\\git.exe");
@@ -615,6 +617,12 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
 
       yield* TestClock.adjust("31 seconds");
       yield* resolve("git", "C:\\one");
+      expect(scans).toHaveLength(7);
+
+      // Another resolver sharing the cache gets its own answer, not the cached one.
+      const elsewhere = yield* resolve("git", "C:\\one", () => "D:\\elsewhere\\git.exe");
+      expect(elsewhere.command).toBe("D:\\elsewhere\\git.exe");
+      expect((yield* resolve("git", "C:\\one")).command).toBe("C:\\one\\git.exe");
       expect(scans).toHaveLength(7);
     }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
   );
