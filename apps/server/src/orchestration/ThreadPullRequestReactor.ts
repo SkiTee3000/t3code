@@ -101,9 +101,12 @@ export const make = Effect.gen(function* () {
     const projects = new Map(snapshot.projects.map((project) => [project.id, project]));
     if (request.backfill) {
       for (const thread of snapshot.threads) {
+        // Only threads the pass below can look up: nothing else removes an entry.
         if (
           (thread.settledOverride === "settled" || thread.settledAt !== null) &&
-          thread.branchPullRequest == null
+          thread.branchPullRequest == null &&
+          thread.archivedAt === null &&
+          thread.branch !== null
         ) {
           pendingBackfill.set(thread.id, BACKFILL_ATTEMPTS);
         }
