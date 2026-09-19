@@ -28,6 +28,10 @@ export interface GitFastPathInput {
   readonly cwd: string;
   readonly args: ReadonlyArray<string>;
   readonly env?: NodeJS.ProcessEnv | undefined;
+  /** The caller's budget for the command; the answer never takes longer than this. */
+  readonly timeoutMs?: number | null | undefined;
+  /** The caller's output cap. A larger answer is left to git, which truncates or fails as asked. */
+  readonly maxOutputBytes?: number | undefined;
 }
 
 export interface GitFastPathAnswer {
@@ -41,6 +45,8 @@ export const isGitFastPathEnabled = (env: NodeJS.ProcessEnv = process.env) =>
   env.T3CODE_GIT_FAST_PATH !== "0";
 
 const ANSWER_TIMEOUT_MS = 2_000;
+// Same default as the process runners that would otherwise spawn git.
+const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 
 class Unsure extends Error {}
 /** Discovery reached the filesystem root, and git agreed: exit 128 with this stderr. */
@@ -88,6 +94,27 @@ function hasGitEnvOverride(env: NodeJS.ProcessEnv | undefined): boolean {
   return false;
 }
 
+// Where git finds itself and its system/global config. The cached listing and
+// verdicts come from git run with the server's own environment.
+const GIT_LOCATION_ENV = new Set([
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "XDG_CONFIG_HOME",
+  "PATH",
+]);
+
+function movesGitOrItsConfig(env: NodeJS.ProcessEnv | undefined): boolean {
+  if (!env) return false;
+  for (const [key, value] of Object.entries(env)) {
+    // Windows environment names ignore case; `process.env` lookups there do too.
+    const name = NodePath.sep === "\\" ? key.toUpperCase() : key;
+    if (GIT_LOCATION_ENV.has(name) && value !== process.env[key]) return true;
+  }
+  return false;
+}
+
 const toGitPath = (value: string) => (NodePath.sep === "\\" ? value.replaceAll("\\", "/") : value);
 
 async function statOrNull(target: string) {
@@ -106,15 +133,35 @@ const PACKED_REFS_BYTES = 32 * 1024 * 1024;
 
 /** Text of a regular file no larger than `maxBytes`, `null` when it does not exist. */
 async function readBoundedFile(file: string, maxBytes: number): Promise<string | null> {
-  const stat = await NodeFSP.stat(file).catch((error: NodeJS.ErrnoException) =>
+  // One handle for the check and the read: a path checked first and opened later
+  // can be swapped for a FIFO or a huge file in between. O_NONBLOCK keeps the
+  // open itself from waiting on a FIFO; Windows has neither.
+  const handle = await NodeFSP.open(
+    file,
+    NodeFSP.constants.O_RDONLY | (NodeFSP.constants.O_NONBLOCK ?? 0),
+  ).catch((error: NodeJS.ErrnoException) =>
     error.code === "ENOENT" || error.code === "ENOTDIR" ? null : unsure("unreadable file"),
   );
-  if (stat === null) return null;
-  if (!stat.isFile() || stat.size > maxBytes) unsure("not a small regular file");
-  const text = await NodeFSP.readFile(file, "utf8");
-  // Lossy decoding or a NUL would make the answer differ from git's bytes.
-  if (text.includes("\0") || text.includes("\ufffd")) unsure("binary content");
-  return text;
+  if (handle === null) return null;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > maxBytes) unsure("not a small regular file");
+    // One spare byte shows a file that grew after the size was taken.
+    const buffer = Buffer.alloc(stat.size + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > stat.size) unsure("file grew while it was read");
+    const text = buffer.toString("utf8", 0, length);
+    // Lossy decoding or a NUL would make the answer differ from git's bytes.
+    if (text.includes("\0") || text.includes("\ufffd")) unsure("binary content");
+    return text;
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -289,6 +336,15 @@ function listOuterConfig(): Promise<string> {
   });
 }
 
+/** Where git looks for an `include.path` value found in `originFile`. */
+function includedConfigFile(originFile: string, value: string): string {
+  if (value === "~" || value.startsWith("~/"))
+    return NodePath.join(NodeOS.homedir(), value.slice(1));
+  // `~user/` needs the account database; `%(prefix)/` needs git's install location.
+  if (value.startsWith("~") || value.startsWith("%(")) unsure("outer config: include location");
+  return NodePath.resolve(NodePath.dirname(originFile), value);
+}
+
 async function loadOuterConfig(): Promise<OuterConfig> {
   // Records: scope NUL origin NUL key LF value NUL
   const fields = (await listOuterConfig()).split("\0");
@@ -300,10 +356,15 @@ async function loadOuterConfig(): Promise<OuterConfig> {
     const record = fields[index + 2]!;
     if (scope !== "system" && scope !== "global") continue;
     if (!origin.startsWith("file:")) unsure("outer config: non-file origin");
-    origins.push(NodePath.resolve(origin.slice("file:".length)));
+    const originFile = NodePath.resolve(origin.slice("file:".length));
+    origins.push(originFile);
     const separator = record.indexOf("\n");
     if (separator === -1) unsure("outer config: value-less key");
-    entries.push({ key: record.slice(0, separator), value: record.slice(separator + 1) });
+    const entry = { key: record.slice(0, separator), value: record.slice(separator + 1) };
+    entries.push(entry);
+    // An included file that is missing or empty lists no entries of its own, so
+    // it is watched by name: the listing is stale once it gains content.
+    if (entry.key === "include.path") origins.push(includedConfigFile(originFile, entry.value));
   }
   const files = outerConfigCandidates(origins);
   return { entries, files, fingerprint: await fingerprintFiles(files), loadedAtMs: Date.now() };
@@ -1156,17 +1217,23 @@ export async function tryAnswerGitCommand(
 ): Promise<GitFastPathAnswer | null> {
   if (!isGitFastPathEnabled() || !isGitFastPathEnabled(input.env ?? {})) return null;
   if (hasGitEnvOverride(process.env) || hasGitEnvOverride(input.env)) return null;
+  if (movesGitOrItsConfig(input.env)) return null;
+  const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   let timer: NodeJS.Timeout | undefined;
   try {
     // Reads that take this long mean a stuck disk or share; git gets the question instead.
     const timedOut = new Promise<null>((resolve) => {
-      timer = setTimeout(resolve, ANSWER_TIMEOUT_MS, null);
+      timer = setTimeout(resolve, Math.min(ANSWER_TIMEOUT_MS, input.timeoutMs ?? Infinity), null);
     });
     // Asking for the outer config first proves git runs at all, so a missing git is not papered over.
     const answering = getOuterConfig().then(() => answer(input));
     // When the timer wins, the abandoned attempt still settles; its decline is not an error.
     answering.catch(() => undefined);
-    return await Promise.race([answering, timedOut]);
+    const result = await Promise.race([answering, timedOut]);
+    return result !== null &&
+      Math.max(Buffer.byteLength(result.stdout), Buffer.byteLength(result.stderr)) > maxOutputBytes
+      ? null
+      : result;
   } catch (error) {
     return error instanceof NotARepository && !gitMessagesMayBeTranslated(input.env)
       ? { exitCode: 128, stdout: "", stderr: error.stderr }

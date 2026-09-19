@@ -507,7 +507,13 @@ const gitCommand = (
 ) =>
   Effect.promise(() =>
     options?.stdin === undefined
-      ? GitMetadataFastPath.tryAnswerGitCommand({ cwd, args, env: options?.env })
+      ? GitMetadataFastPath.tryAnswerGitCommand({
+          cwd,
+          args,
+          env: options?.env,
+          timeoutMs: options?.timeoutMs,
+          maxOutputBytes: options?.maxOutputBytes,
+        })
       : Promise.resolve(null),
   ).pipe(
     Effect.flatMap((answer) =>

@@ -838,6 +838,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         cwd: input.cwd,
         args: input.args,
         env: input.env,
+        timeoutMs: input.timeoutMs,
+        maxOutputBytes: input.maxOutputBytes,
       }),
     );
     // A failing exit code without allowNonZeroExit needs git's own error details.

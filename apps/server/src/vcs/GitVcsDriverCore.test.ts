@@ -397,6 +397,13 @@ it.effect("answers metadata from the repository files and leaves failures to git
     const failed = yield* execute(missingRef, false).pipe(Effect.result);
     assert.isTrue(Result.isFailure(failed));
     assert.deepStrictEqual(spawned, [missingRef]);
+
+    // An answer over the caller's output cap is git's to truncate or reject.
+    const getUrl = ["remote", "get-url", "origin"];
+    yield* driver
+      .execute({ operation: "GitVcsDriver.test.fastPath", cwd, args: getUrl, maxOutputBytes: 8 })
+      .pipe(Effect.result);
+    assert.deepStrictEqual(spawned, [missingRef, getUrl]);
   }).pipe(Effect.provide(layer));
 });
 
