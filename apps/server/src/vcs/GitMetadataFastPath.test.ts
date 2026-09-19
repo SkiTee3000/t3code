@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-p
 
 import {
   gitAnswerMemoKey,
+  makeTaskLimiter,
   parseGitConfig,
   rememberGitAnswer,
   resetGitFastPathCaches,
@@ -509,6 +510,9 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
   it("stays inside the caller's time and output budget", async () => {
     const cwd = repos.plain!;
     expect(await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], timeoutMs: 0 })).toBeNull();
+    // Same with everything already cached, when the reads alone might beat a zero timer.
+    expect(await tryAnswerGitCommand({ cwd, args: ["remote", "-v"] })).not.toBeNull();
+    expect(await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], timeoutMs: 0 })).toBeNull();
     expect(
       await tryAnswerGitCommand({ cwd, args: ["remote", "-v"], timeoutMs: null }),
     ).not.toBeNull();
@@ -737,6 +741,43 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
       `${headOf(main)}\n`,
     );
     await agreesWithGit(linked, "rev-parse", "--abbrev-ref", "HEAD");
+  });
+});
+
+describe("makeTaskLimiter", () => {
+  it("runs a bounded number of tasks at once and frees the slot of a failed one", async () => {
+    const limit = makeTaskLimiter(3);
+    const release: Array<(fail: boolean) => void> = [];
+    let running = 0;
+    let mostRunning = 0;
+    const results = Array.from({ length: 10 }, (_, index) =>
+      limit(async () => {
+        mostRunning = Math.max(mostRunning, ++running);
+        const failed = await new Promise<boolean>((resolve) => release.push(resolve));
+        running--;
+        if (failed) throw new Error(`task ${index}`);
+        return index;
+      }).catch((error: Error) => error.message),
+    );
+    // Release in start order; every third task fails.
+    for (let done = 0; done < 10; done++) {
+      while (release.length <= done) await new Promise((resolve) => setImmediate(resolve));
+      expect(running).toBeLessThanOrEqual(3);
+      release[done]!(done % 3 === 0);
+    }
+    expect(await Promise.all(results)).toEqual([
+      "task 0",
+      1,
+      2,
+      "task 3",
+      4,
+      5,
+      "task 6",
+      7,
+      8,
+      "task 9",
+    ]);
+    expect(mostRunning).toBe(3);
   });
 });
 
