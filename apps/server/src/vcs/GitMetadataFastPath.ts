@@ -306,7 +306,9 @@ interface OuterConfig {
 }
 
 const OUTER_CONFIG_MAX_AGE_MS = 5 * 60_000;
+const OUTER_CONFIG_RETRY_MS = 30_000;
 let outerConfig: Promise<OuterConfig> | null = null;
+let outerConfigFailedAtMs: number | null = null;
 
 function outerConfigCandidates(origins: ReadonlyArray<string>): ReadonlyArray<string> {
   const home = NodeOS.homedir();
@@ -385,13 +387,28 @@ async function getOuterConfig(): Promise<ReadonlyArray<GitConfigEntry>> {
     return current.entries;
   }
   // Concurrent callers share one listing.
-  if (outerConfig === pending) outerConfig = loadOuterConfig();
+  if (outerConfig === pending) {
+    // A listing that failed (no git, a config this reader refuses) fails again;
+    // retrying it for every command would add a spawn to each one.
+    if (
+      outerConfigFailedAtMs !== null &&
+      Date.now() - outerConfigFailedAtMs < OUTER_CONFIG_RETRY_MS
+    )
+      unsure("outer config unavailable");
+    const loading = loadOuterConfig();
+    loading.then(
+      () => (outerConfigFailedAtMs = null),
+      () => (outerConfigFailedAtMs = Date.now()),
+    );
+    outerConfig = loading;
+  }
   return (await outerConfig!).entries;
 }
 
 /** Test seam: forget the cached system/global config. */
 export const resetGitFastPathCaches = () => {
   outerConfig = null;
+  outerConfigFailedAtMs = null;
   verdicts.clear();
   packedRefsCache.clear();
   revListMemo.clear();
@@ -646,6 +663,8 @@ type RefState = "exists" | "missing";
 /** Object id a ref points at, `null` when the ref does not exist. */
 async function refObjectId(repo: Repository, ref: string): Promise<string | null> {
   if (!isSafeRefName(ref)) unsure("unsafe ref name");
+  // These live in each worktree's own git directory, not in the common one read below.
+  if (/^refs\/(?:bisect|worktree|rewritten)\//.test(ref)) unsure("per-worktree ref");
   const looseFile = NodePath.join(repo.commonDir, ...ref.split("/"));
   // A directory here means deeper refs exist (`refs/heads/a` vs `refs/heads/a/b`), not this one.
   const loose = (await statOrNull(looseFile))?.isDirectory()
