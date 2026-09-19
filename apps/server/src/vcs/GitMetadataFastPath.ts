@@ -115,6 +115,31 @@ function movesGitOrItsConfig(env: NodeJS.ProcessEnv | undefined): boolean {
   return false;
 }
 
+/**
+ * Runs at most `max` of the given tasks at once, the rest in arrival order.
+ * Exported for tests.
+ */
+export function makeTaskLimiter(max: number) {
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    // A finishing task hands its slot to the next one, so `running` stays put.
+    if (running >= max) await new Promise<void>((resolve) => waiting.push(resolve));
+    else running++;
+    try {
+      return await task();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else running--;
+    }
+  };
+}
+
+// The git processes started here run outside the drivers' process permits. A
+// sweep over many repositories asks for one verdict each, all at once.
+const withOwnGitProcess = makeTaskLimiter(4);
+
 const toGitPath = (value: string) => (NodePath.sep === "\\" ? value.replaceAll("\\", "/") : value);
 
 async function statOrNull(target: string) {
@@ -328,14 +353,17 @@ async function fingerprintFiles(files: ReadonlyArray<string>): Promise<string> {
 }
 
 function listOuterConfig(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    NodeChildProcess.execFile(
-      "git",
-      ["config", "--list", "--show-scope", "--show-origin", "-z"],
-      { cwd: NodeOS.tmpdir(), windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 },
-      (error, stdout) => (error ? reject(error) : resolve(stdout)),
-    );
-  });
+  return withOwnGitProcess(
+    () =>
+      new Promise((resolve, reject) => {
+        NodeChildProcess.execFile(
+          "git",
+          ["config", "--list", "--show-scope", "--show-origin", "-z"],
+          { cwd: NodeOS.tmpdir(), windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 },
+          (error, stdout) => (error ? reject(error) : resolve(stdout)),
+        );
+      }),
+  );
 }
 
 /** Where git looks for an `include.path` value found in `originFile`. */
@@ -555,23 +583,30 @@ interface GitVerdict {
 const verdicts = new Map<string, { readonly at: number; readonly verdict: Promise<GitVerdict> }>();
 
 function askGit(args: ReadonlyArray<string>): Promise<GitVerdict> {
-  return new Promise((resolve, reject) => {
-    NodeChildProcess.execFile(
-      "git",
-      [...args],
-      {
-        cwd: NodeOS.tmpdir(),
-        env: { ...process.env, LC_ALL: "C" },
-        windowsHide: true,
-        timeout: 10_000,
-        maxBuffer: 64 * 1024,
-      },
-      (error, stdout, stderr) =>
-        error && typeof error.code !== "number"
-          ? reject(error)
-          : resolve({ exitCode: typeof error?.code === "number" ? error.code : 0, stdout, stderr }),
-    );
-  });
+  return withOwnGitProcess(
+    () =>
+      new Promise((resolve, reject) => {
+        NodeChildProcess.execFile(
+          "git",
+          [...args],
+          {
+            cwd: NodeOS.tmpdir(),
+            env: { ...process.env, LC_ALL: "C" },
+            windowsHide: true,
+            timeout: 10_000,
+            maxBuffer: 64 * 1024,
+          },
+          (error, stdout, stderr) =>
+            error && typeof error.code !== "number"
+              ? reject(error)
+              : resolve({
+                  exitCode: typeof error?.code === "number" ? error.code : 0,
+                  stdout,
+                  stderr,
+                }),
+        );
+      }),
+  );
 }
 
 function gitVerdict(args: ReadonlyArray<string>): Promise<GitVerdict> {
@@ -1237,6 +1272,8 @@ export async function tryAnswerGitCommand(
   if (!isGitFastPathEnabled() || !isGitFastPathEnabled(input.env ?? {})) return null;
   if (hasGitEnvOverride(process.env) || hasGitEnvOverride(input.env)) return null;
   if (movesGitOrItsConfig(input.env)) return null;
+  // No budget at all: nothing may be answered, however fast the reads turn out.
+  if (typeof input.timeoutMs === "number" && input.timeoutMs <= 0) return null;
   const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   let timer: NodeJS.Timeout | undefined;
   try {
