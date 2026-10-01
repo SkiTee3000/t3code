@@ -77,6 +77,9 @@ const makeSuccessfulHandle = (stdout: string) =>
     getOutputFd: () => Stream.empty,
   });
 
+// Permit tests drive TestClock; the fast path reads real files on the real clock first.
+const SPAWN_ONLY_ENV = { T3CODE_GIT_FAST_PATH: "0" };
+
 const makeTmpDir = (
   prefix = "git-vcs-driver-test-",
 ): Effect.Effect<string, PlatformError.PlatformError, FileSystem.FileSystem | Scope.Scope> =>
@@ -181,6 +184,7 @@ it.effect("bounds Git bursts across drivers without timing out queued commands",
           operation: "test.gitBurst",
           cwd: "/repo",
           args: ["rev-parse", "HEAD"],
+          env: SPAWN_ONLY_ENV,
           ...(index < 4 ? {} : { timeoutMs: index < 8 ? 30_000 : 1_000 }),
         }),
       { concurrency: "unbounded" },
@@ -232,12 +236,23 @@ it.effect.each([{ timeoutMs: null }, { timeoutMs: 30_001 }])(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
       const slow = yield* driver
-        .execute({ operation: "test.slowGit", cwd: "/repo", args: ["push"], timeoutMs })
+        .execute({
+          operation: "test.slowGit",
+          cwd: "/repo",
+          args: ["push"],
+          env: SPAWN_ONLY_ENV,
+          timeoutMs,
+        })
         .pipe(Effect.forkChild);
       yield* Queue.take(starts);
       const burst = yield* Effect.all(
         Array.from({ length: 8 }, () =>
-          driver.execute({ operation: "test.fastGit", cwd: "/repo", args: ["status"] }),
+          driver.execute({
+            operation: "test.fastGit",
+            cwd: "/repo",
+            args: ["status"],
+            env: SPAWN_ONLY_ENV,
+          }),
         ),
         { concurrency: "unbounded" },
       ).pipe(Effect.forkChild);

@@ -1272,20 +1272,12 @@ export async function tryAnswerGitCommand(
   if (!isGitFastPathEnabled() || !isGitFastPathEnabled(input.env ?? {})) return null;
   if (hasGitEnvOverride(process.env) || hasGitEnvOverride(input.env)) return null;
   if (movesGitOrItsConfig(input.env)) return null;
-  // No budget at all: nothing may be answered, however fast the reads turn out.
-  if (typeof input.timeoutMs === "number" && input.timeoutMs <= 0) return null;
   const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-  let timer: NodeJS.Timeout | undefined;
   try {
-    // Reads that take this long mean a stuck disk or share; git gets the question instead.
-    const timedOut = new Promise<null>((resolve) => {
-      timer = setTimeout(resolve, Math.min(ANSWER_TIMEOUT_MS, input.timeoutMs ?? Infinity), null);
-    });
     // Asking for the outer config first proves git runs at all, so a missing git is not papered over.
-    const answering = getOuterConfig().then(() => answer(input));
-    // When the timer wins, the abandoned attempt still settles; its decline is not an error.
-    answering.catch(() => undefined);
-    const result = await Promise.race([answering, timedOut]);
+    const result = await withinReadBudget(input.timeoutMs, () =>
+      getOuterConfig().then(() => answer(input)),
+    );
     return result !== null &&
       Math.max(Buffer.byteLength(result.stdout), Buffer.byteLength(result.stderr)) > maxOutputBytes
       ? null
@@ -1294,6 +1286,30 @@ export async function tryAnswerGitCommand(
     return error instanceof NotARepository && !gitMessagesMayBeTranslated(input.env)
       ? { exitCode: 128, stdout: "", stderr: error.stderr }
       : null;
+  }
+}
+
+/**
+ * Settles with `work`'s result, or with `null` once the caller's budget or
+ * ANSWER_TIMEOUT_MS runs out, whichever comes first. A rejection of `work`
+ * before then is passed on.
+ */
+async function withinReadBudget<T>(
+  timeoutMs: number | null | undefined,
+  work: () => Promise<T>,
+): Promise<T | null> {
+  // No budget at all: nothing may be answered, however fast the reads turn out.
+  if (typeof timeoutMs === "number" && timeoutMs <= 0) return null;
+  let timer: NodeJS.Timeout | undefined;
+  // Reads that take this long mean a stuck disk or share; git gets the question instead.
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(resolve, Math.min(ANSWER_TIMEOUT_MS, timeoutMs ?? Infinity), null);
+  });
+  const working = work();
+  // When the timer wins, the abandoned attempt still settles; its decline is not an error.
+  working.catch(() => undefined);
+  try {
+    return await Promise.race([working, timedOut]);
   } finally {
     clearTimeout(timer);
   }
@@ -1311,9 +1327,12 @@ export async function gitAnswerMemoKey(input: GitFastPathInput): Promise<string 
   const [command, ...rest] = input.args;
   if (command !== "rev-list") return null;
   try {
-    const { repo } = await discoverRepository(input.cwd);
-    await requireGitAgrees(repo, false);
-    return (await revListQuery(repo, rest)).key;
+    // Without a key git still runs, so a stuck disk must not hold up the spawn.
+    return await withinReadBudget(input.timeoutMs, async () => {
+      const { repo } = await discoverRepository(input.cwd);
+      await requireGitAgrees(repo, false);
+      return (await revListQuery(repo, rest)).key;
+    });
   } catch {
     return null;
   }

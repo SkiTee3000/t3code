@@ -967,7 +967,12 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         } satisfies GitVcsDriver.ExecuteGitResult;
       });
 
-      const fastPathInput = { cwd: input.cwd, args: input.args, env: input.env };
+      const fastPathInput = {
+        cwd: input.cwd,
+        args: input.args,
+        env: input.env,
+        timeoutMs: input.timeoutMs,
+      };
       const memoKey =
         input.stdin === undefined && input.progress === undefined
           ? yield* Effect.promise(() => GitMetadataFastPath.gitAnswerMemoKey(fastPathInput))

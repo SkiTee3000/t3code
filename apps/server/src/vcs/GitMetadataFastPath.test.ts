@@ -292,6 +292,8 @@ describe("GitMetadataFastPath", () => {
     expect(key).not.toBeNull();
     await rememberGitAnswer(input, key!, ask());
     expect(await tryAnswerGitCommand(input)).toMatchObject({ exitCode: 0, stdout: "1\t0\n" });
+    // The key lookup shares the caller's budget: git is about to run either way.
+    expect(await gitAnswerMemoKey({ ...input, timeoutMs: 0 })).toBeNull();
 
     // A moved ref is a different question.
     commit(cwd, "local 2");
