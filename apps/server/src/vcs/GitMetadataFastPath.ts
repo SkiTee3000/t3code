@@ -45,6 +45,8 @@ export const isGitFastPathEnabled = (env: NodeJS.ProcessEnv = process.env) =>
   env.T3CODE_GIT_FAST_PATH !== "0";
 
 const ANSWER_TIMEOUT_MS = 2_000;
+// Attempts that ran out of budget while their reads were still pending.
+let abandonedReads = 0;
 // Same default as the process runners that would otherwise spawn git.
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 
@@ -1294,24 +1296,38 @@ export async function tryAnswerGitCommand(
  * ANSWER_TIMEOUT_MS runs out, whichever comes first. A rejection of `work`
  * before then is passed on.
  */
-async function withinReadBudget<T>(
+export async function withinReadBudget<T>(
   timeoutMs: number | null | undefined,
   work: () => Promise<T>,
 ): Promise<T | null> {
   // No budget at all: nothing may be answered, however fast the reads turn out.
   if (typeof timeoutMs === "number" && timeoutMs <= 0) return null;
+  // A started read cannot be cancelled and holds one of libuv's few threads until
+  // the disk answers. Starting more while one is stuck would pile them up and
+  // stall every file operation in the server, so git gets every question instead.
+  if (abandonedReads > 0) return null;
   let timer: NodeJS.Timeout | undefined;
   // Reads that take this long mean a stuck disk or share; git gets the question instead.
   const timedOut = new Promise<null>((resolve) => {
     timer = setTimeout(resolve, Math.min(ANSWER_TIMEOUT_MS, timeoutMs ?? Infinity), null);
   });
-  const working = work();
+  let settled = false;
+  const working = work().finally(() => {
+    settled = true;
+  });
   // When the timer wins, the abandoned attempt still settles; its decline is not an error.
   working.catch(() => undefined);
   try {
     return await Promise.race([working, timedOut]);
   } finally {
     clearTimeout(timer);
+    if (!settled) {
+      abandonedReads++;
+      void working.then(
+        () => abandonedReads--,
+        () => abandonedReads--,
+      );
+    }
   }
 }
 

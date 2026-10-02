@@ -12,6 +12,7 @@ import {
   rememberGitAnswer,
   resetGitFastPathCaches,
   tryAnswerGitCommand,
+  withinReadBudget,
 } from "./GitMetadataFastPath.ts";
 
 const git = (cwd: string, ...args: ReadonlyArray<string>) =>
@@ -507,6 +508,32 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     };
     await answered("later.inc", "later");
     await answered("tilde.inc", "tilde");
+  });
+
+  it("starts no reads while an abandoned one is still stuck", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let releaseStuck!: () => void;
+      const stuck = withinReadBudget(
+        10,
+        () =>
+          new Promise<string>((resolve) => {
+            releaseStuck = () => resolve("late");
+          }),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      expect(await stuck).toBeNull();
+
+      const work = vi.fn(async () => "fresh");
+      expect(await withinReadBudget(10, work)).toBeNull();
+      expect(work).not.toHaveBeenCalled();
+
+      releaseStuck();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await withinReadBudget(10, work)).toBe("fresh");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stays inside the caller's time and output budget", async () => {

@@ -33,7 +33,12 @@ import { compactTraceAttributes } from "@t3tools/shared/observability";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveProjectFileBackedSetting } from "@t3tools/shared/projectSettings";
-import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
+import {
+  gitCommandDuration,
+  gitCommandsTotal,
+  recordMetrics,
+  withMetrics,
+} from "../observability/Metrics.ts";
 import * as GitMetadataFastPath from "./GitMetadataFastPath.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import {
@@ -1008,7 +1013,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   );
 
   const execute: GitVcsDriver.GitVcsDriver["Service"]["execute"] = (input) => {
-    // Times the command itself, not the wait for a process permit.
+    // Times the command itself, not the wait for a process permit. An answered
+    // command took as long as its file reads; a miss is timed from its spawn.
     const metrics = {
       counter: gitCommandsTotal,
       timer: gitCommandDuration,
@@ -1017,10 +1023,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       },
     };
     const spawnGit = executeRaw(input).pipe(withMetrics(metrics));
-    return answerWithoutGit(input).pipe(
-      Effect.flatMap((answer) =>
+    return Effect.timed(answerWithoutGit(input)).pipe(
+      Effect.flatMap(([readDuration, answer]) =>
         answer !== null
-          ? Effect.succeed(answer).pipe(withMetrics(metrics))
+          ? recordMetrics(metrics, Exit.succeed(answer), readDuration).pipe(Effect.as(answer))
           : input.timeoutMs === null || (input.timeoutMs ?? DEFAULT_TIMEOUT_MS) > DEFAULT_TIMEOUT_MS
             ? spawnGit
             : gitProcesses.withPermits(1)(spawnGit),
