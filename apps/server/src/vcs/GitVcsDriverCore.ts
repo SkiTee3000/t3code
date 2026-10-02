@@ -982,18 +982,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         input.stdin === undefined && input.progress === undefined
           ? yield* Effect.promise(() => GitMetadataFastPath.gitAnswerMemoKey(fastPathInput))
           : null;
-      const execution = runGitCommand().pipe(
-        Effect.scoped,
-        Effect.tap((result) =>
-          memoKey !== null && result.exitCode === 0 && !result.stdoutTruncated
-            ? Effect.promise(() =>
-                GitMetadataFastPath.rememberGitAnswer(fastPathInput, memoKey, result.stdout),
-              )
-            : Effect.void,
-        ),
-      );
+      // Runs after the timeout: timeoutMs bounds git, and a slow memo must not discard its answer.
+      const remember = (result: GitVcsDriver.ExecuteGitResult) =>
+        memoKey !== null && result.exitCode === 0 && !result.stdoutTruncated
+          ? Effect.promise(() =>
+              GitMetadataFastPath.rememberGitAnswer(fastPathInput, memoKey, result.stdout),
+            )
+          : Effect.void;
+      const execution = runGitCommand().pipe(Effect.scoped);
       if (timeoutMs === null) {
-        return yield* execution;
+        return yield* execution.pipe(Effect.tap(remember));
       }
 
       return yield* execution.pipe(
@@ -1008,6 +1006,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
               }),
           ),
         ),
+        Effect.tap(remember),
       );
     },
   );

@@ -41,7 +41,7 @@ export interface GitFastPathAnswer {
 }
 
 /** `T3CODE_GIT_FAST_PATH=0` turns the fast path off; every command spawns git again. */
-export const isGitFastPathEnabled = (env: NodeJS.ProcessEnv = process.env) =>
+const isGitFastPathEnabled = (env: NodeJS.ProcessEnv = process.env) =>
   env.T3CODE_GIT_FAST_PATH !== "0";
 
 const ANSWER_TIMEOUT_MS = 2_000;
