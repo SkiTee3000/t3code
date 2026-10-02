@@ -532,6 +532,8 @@ async function discoverRepository(cwd: string): Promise<{ repo: Repository; real
   const realCwd = await NodeFSP.realpath(cwd);
   if (realCwd.startsWith("\\\\")) unsure("UNC path");
   const startStat = await NodeFSP.stat(realCwd);
+  // git cannot even start in a file; walking up from it would answer for the parent repository.
+  if (!startStat.isDirectory()) unsure("cwd is not a directory");
   // Windows has no device ids worth comparing, and git for Windows does not compare them either.
   const checkBoundaries = NodePath.sep !== "\\";
 

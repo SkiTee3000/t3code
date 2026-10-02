@@ -597,6 +597,17 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     }
   });
 
+  it("leaves a file given as the working directory to git", async () => {
+    const file = NodePath.join(repos.plain!, "not-a-directory.txt");
+    NodeFS.writeFileSync(file, "");
+    try {
+      await declines(file, "rev-parse", "--abbrev-ref", "HEAD");
+      await declines(file, "remote");
+    } finally {
+      NodeFS.rmSync(file);
+    }
+  });
+
   it("leaves refs that belong to one worktree to git", async () => {
     const linked = repos.linkedWorktree!;
     git(linked, "update-ref", "refs/bisect/bad", "HEAD");
