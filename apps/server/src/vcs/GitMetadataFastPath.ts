@@ -19,7 +19,7 @@
  * git is asked once per repository and the verdict is reused for a few minutes.
  * This module only ever reads text and never runs anything a repository configures.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
+import * as NodeAsyncHooks from "node:async_hooks";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -150,7 +150,7 @@ const toGitPath = (value: string) => (NodePath.sep === "\\" ? value.replaceAll("
 // Directories found free of symlinks, with their ancestors, are remembered only
 // for the rest of one query: a later one checks them again, since any may have
 // been swapped for a symlink in between.
-const symlinkFreeDirs = new AsyncLocalStorage<Set<string>>();
+const symlinkFreeDirs = new NodeAsyncHooks.AsyncLocalStorage<Set<string>>();
 
 /** Runs one query with its own memory of checked directories. */
 const withFreshSymlinkChecks = <T>(work: () => Promise<T>): Promise<T> =>
