@@ -663,9 +663,15 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     await declines(linked, "remote");
   });
 
-  it("leaves a symlinked refs directory to git", async () => {
+  it("leaves a refs directory swapped for a symlink to git, even after reading it", async () => {
     const cwd = makeRepo("symlinkedRefs", (dir) => git(dir, "branch", "feature/linked"));
     const heads = NodePath.join(cwd, ".git", "refs", "heads");
+    expect(
+      await tryAnswerGitCommand({
+        cwd,
+        args: ["show-ref", "--verify", "--quiet", "refs/heads/feature/linked"],
+      }),
+    ).toMatchObject({ exitCode: 0 });
     const moved = NodePath.join(root, "symlinkedRefsTarget");
     NodeFS.renameSync(NodePath.join(heads, "feature"), moved);
     // A junction needs no privilege on Windows and is a symlink everywhere else.

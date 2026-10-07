@@ -19,6 +19,7 @@
  * git is asked once per repository and the verdict is reused for a few minutes.
  * This module only ever reads text and never runs anything a repository configures.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -146,23 +147,25 @@ const toGitPath = (value: string) => (NodePath.sep === "\\" ? value.replaceAll("
 
 // Symlinks are git's to follow: one inside repository metadata can point at a
 // `\\server\share` path, and touching that makes Windows authenticate to the server.
-// Directories found free of symlinks are remembered briefly, with their ancestors.
-const SYMLINK_FREE_MAX_AGE_MS = 5 * 60_000;
-const symlinkFreeDirs = new Map<string, number>();
+// Directories found free of symlinks, with their ancestors, are remembered only
+// for the rest of one query: a later one checks them again, since any may have
+// been swapped for a symlink in between.
+const symlinkFreeDirs = new AsyncLocalStorage<Set<string>>();
+
+/** Runs one query with its own memory of checked directories. */
+const withFreshSymlinkChecks = <T>(work: () => Promise<T>): Promise<T> =>
+  symlinkFreeDirs.run(new Set(), work);
 
 function isKnownSymlinkFree(dir: string): boolean {
-  const now = Date.now();
-  for (const [known, at] of symlinkFreeDirs) {
-    if (now - at >= SYMLINK_FREE_MAX_AGE_MS) continue;
-    if (known === dir || known.startsWith(dir.endsWith(NodePath.sep) ? dir : dir + NodePath.sep))
-      return true;
+  const prefix = dir.endsWith(NodePath.sep) ? dir : dir + NodePath.sep;
+  for (const known of symlinkFreeDirs.getStore() ?? []) {
+    if (known === dir || known.startsWith(prefix)) return true;
   }
   return false;
 }
 
 function rememberSymlinkFree(dir: string): void {
-  if (symlinkFreeDirs.size >= 256) symlinkFreeDirs.clear();
-  symlinkFreeDirs.set(dir, Date.now());
+  symlinkFreeDirs.getStore()?.add(dir);
 }
 
 /** Declines when `target` or a directory above it is a symlink. */
@@ -483,7 +486,6 @@ export const resetGitFastPathCaches = () => {
   outerConfig = null;
   outerConfigFailedAtMs = null;
   verdicts.clear();
-  symlinkFreeDirs.clear();
   packedRefsCache.clear();
   revListMemo.clear();
 };
@@ -1346,7 +1348,7 @@ export async function tryAnswerGitCommand(
   try {
     // Asking for the outer config first proves git runs at all, so a missing git is not papered over.
     const result = await withinReadBudget(input.timeoutMs, () =>
-      getOuterConfig().then(() => answer(input)),
+      withFreshSymlinkChecks(() => getOuterConfig().then(() => answer(input))),
     );
     return result !== null &&
       Math.max(Buffer.byteLength(result.stdout), Buffer.byteLength(result.stderr)) > maxOutputBytes
@@ -1412,11 +1414,13 @@ export async function gitAnswerMemoKey(input: GitFastPathInput): Promise<string 
   if (command !== "rev-list") return null;
   try {
     // Without a key git still runs, so a stuck disk must not hold up the spawn.
-    return await withinReadBudget(input.timeoutMs, async () => {
-      const { repo } = await discoverRepository(input.cwd);
-      await requireGitAgrees(repo, false);
-      return (await revListQuery(repo, rest)).key;
-    });
+    return await withinReadBudget(input.timeoutMs, () =>
+      withFreshSymlinkChecks(async () => {
+        const { repo } = await discoverRepository(input.cwd);
+        await requireGitAgrees(repo, false);
+        return (await revListQuery(repo, rest)).key;
+      }),
+    );
   } catch {
     return null;
   }
