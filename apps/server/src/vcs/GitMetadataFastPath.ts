@@ -144,9 +144,48 @@ const withOwnGitProcess = makeTaskLimiter(4);
 
 const toGitPath = (value: string) => (NodePath.sep === "\\" ? value.replaceAll("\\", "/") : value);
 
+// Symlinks are git's to follow: one inside repository metadata can point at a
+// `\\server\share` path, and touching that makes Windows authenticate to the server.
+// Directories found free of symlinks are remembered briefly, with their ancestors.
+const SYMLINK_FREE_MAX_AGE_MS = 5 * 60_000;
+const symlinkFreeDirs = new Map<string, number>();
+
+function isKnownSymlinkFree(dir: string): boolean {
+  const now = Date.now();
+  for (const [known, at] of symlinkFreeDirs) {
+    if (now - at >= SYMLINK_FREE_MAX_AGE_MS) continue;
+    if (known === dir || known.startsWith(dir.endsWith(NodePath.sep) ? dir : dir + NodePath.sep))
+      return true;
+  }
+  return false;
+}
+
+function rememberSymlinkFree(dir: string): void {
+  if (symlinkFreeDirs.size >= 256) symlinkFreeDirs.clear();
+  symlinkFreeDirs.set(dir, Date.now());
+}
+
+/** Declines when `target` or a directory above it is a symlink. */
+async function assertNoSymlinks(target: string): Promise<void> {
+  const parent = NodePath.dirname(target);
+  let parentChecked = false;
+  for (let dir = parent; !isKnownSymlinkFree(dir);) {
+    const stat = await NodeFSP.lstat(dir).catch(() => null);
+    if (stat?.isSymbolicLink()) unsure("symlink in repository path");
+    if (dir === parent) parentChecked = stat !== null;
+    const above = NodePath.dirname(dir);
+    if (above === dir) break;
+    dir = above;
+  }
+  if (parentChecked) rememberSymlinkFree(parent);
+  const stat = await NodeFSP.lstat(target).catch(() => null);
+  if (stat?.isSymbolicLink()) unsure("symlink in repository path");
+}
+
 async function statOrNull(target: string) {
+  await assertNoSymlinks(target);
   try {
-    return await NodeFSP.stat(target);
+    return await NodeFSP.lstat(target);
   } catch {
     return null;
   }
@@ -162,10 +201,14 @@ const PACKED_REFS_BYTES = 32 * 1024 * 1024;
 async function readBoundedFile(file: string, maxBytes: number): Promise<string | null> {
   // One handle for the check and the read: a path checked first and opened later
   // can be swapped for a FIFO or a huge file in between. O_NONBLOCK keeps the
-  // open itself from waiting on a FIFO; Windows has neither.
+  // open itself from waiting on a FIFO, O_NOFOLLOW from following a swapped-in
+  // symlink; Windows has neither.
+  await assertNoSymlinks(file);
   const handle = await NodeFSP.open(
     file,
-    NodeFSP.constants.O_RDONLY | (NodeFSP.constants.O_NONBLOCK ?? 0),
+    NodeFSP.constants.O_RDONLY |
+      (NodeFSP.constants.O_NONBLOCK ?? 0) |
+      (NodeFSP.constants.O_NOFOLLOW ?? 0),
   ).catch((error: NodeJS.ErrnoException) =>
     error.code === "ENOENT" || error.code === "ENOTDIR" ? null : unsure("unreadable file"),
   );
@@ -440,6 +483,7 @@ export const resetGitFastPathCaches = () => {
   outerConfig = null;
   outerConfigFailedAtMs = null;
   verdicts.clear();
+  symlinkFreeDirs.clear();
   packedRefsCache.clear();
   revListMemo.clear();
 };
@@ -534,6 +578,7 @@ async function discoverRepository(cwd: string): Promise<{ repo: Repository; real
   const startStat = await NodeFSP.stat(realCwd);
   // git cannot even start in a file; walking up from it would answer for the parent repository.
   if (!startStat.isDirectory()) unsure("cwd is not a directory");
+  rememberSymlinkFree(realCwd);
   // Windows has no device ids worth comparing, and git for Windows does not compare them either.
   const checkBoundaries = NodePath.sep !== "\\";
 
@@ -613,8 +658,25 @@ function askGit(args: ReadonlyArray<string>): Promise<GitVerdict> {
   );
 }
 
-function gitVerdict(args: ReadonlyArray<string>): Promise<GitVerdict> {
-  const key = args.join("\0");
+/**
+ * What git's acceptance depends on beyond the path: which directories these are
+ * and who owns them, the repository config, and the system and global config
+ * that hold `safe.directory`. A replaced repository or changed settings get a new verdict.
+ */
+async function repositoryIdentity(repo: Repository): Promise<string> {
+  const directories = await Promise.all(
+    [repo.workTree, repo.gitDir, repo.commonDir].map((dir) => NodeFSP.stat(dir)),
+  );
+  const outer = await outerConfig?.catch(() => null);
+  return [
+    ...directories.map((stat) => `${stat.dev}:${stat.ino}:${stat.uid}:${stat.birthtimeMs}`),
+    await fingerprintFiles([NodePath.join(repo.commonDir, "config")]),
+    outer?.fingerprint ?? "",
+  ].join("|");
+}
+
+function gitVerdict(args: ReadonlyArray<string>, identity = ""): Promise<GitVerdict> {
+  const key = [...args, identity].join("\0");
   const known = verdicts.get(key);
   if (known && Date.now() - known.at < VERDICT_MAX_AGE_MS) return known.verdict;
   if (verdicts.size >= VERDICT_CAPACITY) verdicts.clear();
@@ -627,9 +689,10 @@ function gitVerdict(args: ReadonlyArray<string>): Promise<GitVerdict> {
 
 /** Declines unless git opens the same repository from the same place. */
 async function requireGitAgrees(repo: Repository, explicitGitDir: boolean): Promise<void> {
+  const identity = await repositoryIdentity(repo);
   const verdict = explicitGitDir
-    ? await gitVerdict(["--git-dir", repo.gitDir, "rev-parse", "--git-dir"])
-    : await gitVerdict(["-C", repo.workTree, "rev-parse", "--show-toplevel"]);
+    ? await gitVerdict(["--git-dir", repo.gitDir, "rev-parse", "--git-dir"], identity)
+    : await gitVerdict(["-C", repo.workTree, "rev-parse", "--show-toplevel"], identity);
   if (verdict.exitCode !== 0) unsure("git refuses this repository");
   if (!explicitGitDir && verdict.stdout !== `${toGitPath(repo.workTree)}\n`)
     unsure("git opens a different repository");
@@ -652,7 +715,7 @@ const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9]|conin\$|conou
 /** Accepts only names that are safe to join onto the git directory. */
 function isSafeRefName(ref: string): boolean {
   if (!ref.startsWith("refs/") || ref.endsWith("/") || ref.endsWith(".")) return false;
-  // eslint-disable-next-line no-control-regex
+  // eslint-disable-next-line no-control-regex -- git's check_refname_format rejects control characters
   if (/[\x00-\x20\x7f~^:?*[\\]|\.\.|@\{|\/\//.test(ref)) return false;
   return ref.split("/").every(
     (part) =>
@@ -778,7 +841,9 @@ async function readRemotes(repo: Repository): Promise<ReadonlyArray<Remote>> {
   // URL rewriting changes what git prints for every remote.
   if (config.some(({ key }) => key.startsWith("url."))) unsure("url rewriting");
   for (const legacy of ["remotes", "branches"]) {
-    const names = await NodeFSP.readdir(NodePath.join(repo.commonDir, legacy)).catch(() => []);
+    const dir = NodePath.join(repo.commonDir, legacy);
+    await assertNoSymlinks(dir);
+    const names = await NodeFSP.readdir(dir).catch(() => []);
     if (names.length > 0) unsure("legacy remote files");
   }
 
@@ -942,10 +1007,11 @@ async function listBranchRefs(repo: Repository, namespace: string): Promise<Read
   for (const ref of packed.keys()) if (ref.startsWith(`${namespace}/`)) refs.add(ref);
 
   const walk = async (ref: string): Promise<void> => {
-    const entries = await NodeFSP.readdir(NodePath.join(repo.commonDir, ...ref.split("/")), {
-      withFileTypes: true,
-    }).catch((error: NodeJS.ErrnoException) =>
-      error.code === "ENOENT" ? [] : unsure("unreadable refs directory"),
+    const dir = NodePath.join(repo.commonDir, ...ref.split("/"));
+    await assertNoSymlinks(dir);
+    const entries = await NodeFSP.readdir(dir, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) =>
+        error.code === "ENOENT" ? [] : unsure("unreadable refs directory"),
     );
     for (const entry of entries) {
       const child = `${ref}/${entry.name}`;
@@ -1186,9 +1252,9 @@ async function revListQuery(repo: Repository, args: ReadonlyArray<string>): Prom
   for (const file of ["shallow", NodePath.join("info", "grafts")]) {
     if (await statOrNull(NodePath.join(repo.commonDir, file))) unsure("altered history");
   }
-  const replacements = await NodeFSP.readdir(
-    NodePath.join(repo.commonDir, "refs", "replace"),
-  ).catch(() => []);
+  const replaceDir = NodePath.join(repo.commonDir, "refs", "replace");
+  await assertNoSymlinks(replaceDir);
+  const replacements = await NodeFSP.readdir(replaceDir).catch(() => []);
   const packed = await readPackedRefs(repo.commonDir);
   if (replacements.length > 0 || [...packed.keys()].some((ref) => ref.startsWith("refs/replace/")))
     unsure("altered history");

@@ -663,6 +663,57 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     await declines(linked, "remote");
   });
 
+  it("leaves a symlinked refs directory to git", async () => {
+    const cwd = makeRepo("symlinkedRefs", (dir) => git(dir, "branch", "feature/linked"));
+    const heads = NodePath.join(cwd, ".git", "refs", "heads");
+    const moved = NodePath.join(root, "symlinkedRefsTarget");
+    NodeFS.renameSync(NodePath.join(heads, "feature"), moved);
+    // A junction needs no privilege on Windows and is a symlink everywhere else.
+    NodeFS.symlinkSync(moved, NodePath.join(heads, "feature"), "junction");
+    await declines(cwd, "show-ref", "--verify", "--quiet", "refs/heads/feature/linked");
+    await declines(cwd, "for-each-ref", "--format=%(refname)", "refs/heads");
+  });
+
+  it("leaves a symlinked HEAD to git", async (context) => {
+    const cwd = makeRepo("symlinkedHead");
+    const head = NodePath.join(cwd, ".git", "HEAD");
+    const target = NodePath.join(root, "symlinkedHeadTarget");
+    NodeFS.writeFileSync(target, "ref: refs/heads/main\n");
+    NodeFS.rmSync(head);
+    try {
+      NodeFS.symlinkSync(target, head, "file");
+    } catch {
+      // File symlinks need a privilege on Windows.
+      context.skip();
+    }
+    await declines(cwd, "symbolic-ref", "--quiet", "--short", "HEAD");
+    await declines(cwd, "remote");
+  });
+
+  it("asks git again when another repository takes the path", async () => {
+    const cwd = makeRepo("replaced", (dir) =>
+      git(dir, "remote", "add", "origin", "https://example.com/first.git"),
+    );
+    const remote = ["remote", "get-url", "origin"];
+    expect(await tryAnswerGitCommand({ cwd, args: remote })).toMatchObject({ exitCode: 0 });
+    const savedPath = process.env.PATH;
+    try {
+      // Without git only a remembered verdict can answer.
+      process.env.PATH = NodePath.join(root, "no-git-here");
+      expect(await tryAnswerGitCommand({ cwd, args: remote })).toMatchObject({ exitCode: 0 });
+
+      process.env.PATH = savedPath;
+      NodeFS.rmSync(cwd, { recursive: true, force: true });
+      makeRepo("replaced", (dir) =>
+        git(dir, "remote", "add", "origin", "https://example.com/second.git"),
+      );
+      process.env.PATH = NodePath.join(root, "no-git-here");
+      await declines(cwd, ...remote);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
   it("reads config the way git does, or not at all", async () => {
     const bare = makeRepo("numericBare", (dir) => git(dir, "config", "core.bare", "2"));
     await declines(bare, "rev-parse", "--is-inside-work-tree");
