@@ -916,7 +916,11 @@ async function answerRevParse(
   if (sameArgs(args, ["--git-common-dir"])) {
     // Below the worktree root git prints a relative path; leave that form to git.
     if (realCwd !== repo.workTree) unsure("common dir from a subdirectory");
-    return ok(repo.dotGitIsDirectory ? ".git\n" : `${toGitPath(repo.commonDir)}\n`);
+    return ok(
+      repo.dotGitIsDirectory && repo.commonDir === repo.gitDir
+        ? ".git\n"
+        : `${toGitPath(repo.commonDir)}\n`,
+    );
   }
   if (sameArgs(args, ["--abbrev-ref", "HEAD"])) {
     const head = await readHead(repo);

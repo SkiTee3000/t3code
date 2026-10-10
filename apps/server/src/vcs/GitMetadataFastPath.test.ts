@@ -802,6 +802,22 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     });
   });
 
+  it("names the common directory a .git directory points to", async () => {
+    const shared = makeRepo("commonDirTarget");
+    const cwd = makeRepo("commonDirPointer");
+    NodeFS.writeFileSync(
+      NodePath.join(cwd, ".git", "commondir"),
+      `${NodePath.relative(NodePath.join(cwd, ".git"), NodePath.join(shared, ".git"))}\n`,
+    );
+    const args = ["rev-parse", "--git-common-dir"];
+    const real = NodeChildProcess.spawnSync("git", args, { cwd, encoding: "utf8" });
+    expect(await tryAnswerGitCommand({ cwd, args })).toEqual({
+      exitCode: 0,
+      stdout: real.stdout,
+      stderr: "",
+    });
+  });
+
   it("reads only the refs under the name asked for", async () => {
     const cwd = makeRepo("targetedRefs", (dir) => {
       git(dir, "update-ref", "refs/remotes/origin/main", "HEAD");
