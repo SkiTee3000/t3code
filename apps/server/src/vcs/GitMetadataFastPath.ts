@@ -951,7 +951,9 @@ async function answerRevParse(
 async function answerSymbolicRef(repo: Repository, args: ReadonlyArray<string>) {
   if (sameArgs(args, ["--quiet", "--short", "HEAD"])) {
     const head = await readHead(repo);
-    return head.ref === null ? silentFailure : ok(`${await shortBranchName(repo, head.ref)}\n`);
+    if (head.ref === null) return silentFailure;
+    await refObjectId(repo, head.ref);
+    return ok(`${await shortBranchName(repo, head.ref)}\n`);
   }
   if (
     args.length === 1 &&

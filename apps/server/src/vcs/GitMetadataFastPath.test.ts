@@ -855,6 +855,12 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     });
     await declines(chained, "symbolic-ref", "refs/remotes/origin/HEAD");
 
+    const headChain = makeRepo("headChain", (dir) => {
+      git(dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main");
+      git(dir, "symbolic-ref", "HEAD", "refs/heads/alias");
+    });
+    await declines(headChain, "symbolic-ref", "--quiet", "--short", "HEAD");
+
     const headUpstream = makeRepo("headUpstream", (dir) => {
       git(dir, "remote", "add", "origin", "https://example.com/origin.git");
       git(dir, "update-ref", "refs/remotes/origin/HEAD", "HEAD");
