@@ -802,6 +802,35 @@ describe("GitMetadataFastPath on repositories git treats differently", () => {
     });
   });
 
+  it("reads only the refs under the name asked for", async () => {
+    const cwd = makeRepo("targetedRefs", (dir) => {
+      git(dir, "update-ref", "refs/remotes/origin/main", "HEAD");
+      git(dir, "update-ref", "refs/remotes/origin/mainline", "HEAD");
+      git(dir, "update-ref", "refs/remotes/origin/main-old/nested", "HEAD");
+      git(dir, "update-ref", "refs/remotes/other/main", "HEAD");
+    });
+    NodeFS.writeFileSync(NodePath.join(cwd, ".git", "refs", "remotes", "other", "stray.lock"), "");
+    for (const args of [
+      ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/main"],
+      [
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/remotes/origin/main-old",
+        "refs/remotes/origin/main-old/nested",
+      ],
+      ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/heads/main"],
+    ]) {
+      const real = NodeChildProcess.spawnSync("git", args, { cwd, encoding: "utf8" });
+      expect({ args, answer: await tryAnswerGitCommand({ cwd, args }) }).toEqual({
+        args,
+        answer: { exitCode: 0, stdout: real.stdout, stderr: "" },
+      });
+    }
+    await declines(cwd, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/*/main");
+    await declines(cwd, "for-each-ref", "--format=%(refname)", "refs/remotes");
+    await declines(cwd, "for-each-ref", "--format=%(refname)", "refs/remotes/origin");
+  });
+
   it("leaves symbolic ref chains and remote HEAD upstreams to git", async () => {
     const chained = makeRepo("symrefChain", (dir) => {
       git(dir, "update-ref", "refs/remotes/origin/main", "HEAD");

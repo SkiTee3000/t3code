@@ -1002,23 +1002,27 @@ const UPSTREAM_FORMAT =
 const byteOrder = (left: string, right: string) =>
   Buffer.compare(Buffer.from(left), Buffer.from(right));
 
-/** Every ref below `refs/heads` or `refs/remotes`, loose and packed, that resolves to an object. */
-async function listBranchRefs(repo: Repository, namespace: string): Promise<ReadonlyArray<string>> {
+/**
+ * Every ref whose name starts with `prefix`, loose and packed, that resolves to
+ * an object: the refs git iterates for a pattern without wildcards.
+ */
+async function listBranchRefs(repo: Repository, prefix: string): Promise<ReadonlyArray<string>> {
   const packed = await readPackedRefs(repo.commonDir);
   const refs = new Set<string>();
-  for (const ref of packed.keys()) if (ref.startsWith(`${namespace}/`)) refs.add(ref);
+  for (const ref of packed.keys()) if (ref.startsWith(prefix)) refs.add(ref);
 
-  const walk = async (ref: string): Promise<void> => {
-    const dir = NodePath.join(repo.commonDir, ...ref.split("/"));
+  const visit = async (parent: string, keep: (name: string) => boolean): Promise<void> => {
+    const dir = NodePath.join(repo.commonDir, ...parent.split("/"));
     await assertNoSymlinks(dir);
     const entries = await NodeFSP.readdir(dir, { withFileTypes: true }).catch(
       (error: NodeJS.ErrnoException) =>
         error.code === "ENOENT" ? [] : unsure("unreadable refs directory"),
     );
     for (const entry of entries) {
-      const child = `${ref}/${entry.name}`;
+      if (!keep(entry.name)) continue;
+      const child = `${parent}/${entry.name}`;
       if (entry.isDirectory()) {
-        await walk(child);
+        await visit(child, () => true);
         continue;
       }
       // Lock files, odd names and non-files are git's to judge.
@@ -1039,21 +1043,22 @@ async function listBranchRefs(repo: Repository, namespace: string): Promise<Read
       refs.add(child);
     }
   };
-  await walk(namespace);
+  const slash = prefix.lastIndexOf("/");
+  const base = prefix.slice(slash + 1);
+  await visit(prefix.slice(0, slash), (name) => name.startsWith(base));
   return [...refs];
 }
 
-/** git's pattern rule: the whole ref, a leading directory of it, or a glob where `*` stays within one level. */
+/**
+ * git's pattern rule for a pattern without wildcards: the whole ref or a leading
+ * directory of it. Wildcards make git walk the whole namespace, and so does a
+ * pattern naming no single remote; those are git's to answer.
+ */
 function refPatternMatcher(pattern: string): (ref: string) => boolean {
-  if (!isSafeRefName(pattern.replaceAll("*", "x")) || pattern.includes("**")) unsure("ref pattern");
-  if (!pattern.includes("*")) return (ref) => ref === pattern || ref.startsWith(`${pattern}/`);
-  const glob = new RegExp(
-    `^${pattern
-      .split("*")
-      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-      .join("[^/]*")}$`,
-  );
-  return (ref) => glob.test(ref);
+  if (!isSafeRefName(pattern) || pattern.includes("*")) unsure("ref pattern");
+  if (pattern.startsWith("refs/remotes") && pattern.split("/").length < 4)
+    unsure("every remote-tracking ref");
+  return (ref) => ref === pattern || ref.startsWith(`${pattern}/`);
 }
 
 /** Tracking ref for `branch.<name>.merge` under the remote's fetch refspecs, or `null` when none maps it. */
@@ -1168,17 +1173,12 @@ async function answerForEachRef(repo: Repository, args: ReadonlyArray<string>) {
   if ((format !== REFNAME_FORMAT && format !== UPSTREAM_FORMAT) || patterns.length === 0)
     unsure("for-each-ref arguments");
 
-  const namespaces = new Set<string>();
   for (const pattern of patterns) {
-    const namespace = /^(refs\/(?:heads|remotes))(?:\/|$)/.exec(pattern)?.[1];
-    namespaces.add(namespace ?? unsure("for-each-ref outside branches"));
+    if (!/^refs\/(?:heads|remotes)(?:\/|$)/.test(pattern)) unsure("for-each-ref outside branches");
   }
   const matchers = patterns.map(refPatternMatcher);
-  const listed = await Promise.all(
-    [...namespaces].map((namespace) => listBranchRefs(repo, namespace)),
-  );
-  const refs = listed
-    .flat()
+  const listed = await Promise.all(patterns.map((pattern) => listBranchRefs(repo, pattern)));
+  const refs = [...new Set(listed.flat())]
     .filter((ref) => matchers.some((matches) => matches(ref)))
     .toSorted(byteOrder)
     .slice(0, count);
